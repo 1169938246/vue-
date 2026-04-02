@@ -1,0 +1,217 @@
+# vue-新版本批量下载二维码功能
+# 采用client-zip  file-saver modern-screenshot 
+# 采用 时间分片 + async架构 
+<script lang="ts" setup>
+  import { ref } from 'vue'
+
+  import { useVbenModal } from '@vben/common-ui'
+
+  import { message, Progress, QRCode } from 'ant-design-vue'
+  import { downloadZip } from 'client-zip'
+  import { saveAs } from 'file-saver'
+  import { domToBlob } from 'modern-screenshot'
+
+  // 定义组件接收的数据格式
+  const records = ref<any[]>([])
+
+  // 进度状态
+  const isDownloading = ref(false)
+  const downloadProgress = ref(0)
+  const downloadTotal = ref(0)
+  const cancelDownload = ref(false)
+
+  const [Modal, modalApi] = useVbenModal({
+    closeOnClickModal: false,
+    onOpenChange(isOpen: boolean) {
+      if (isOpen) {
+        const data = modalApi.getData()?.record
+        // 兼容单条对象或多条数组的传参方式
+        if (Array.isArray(data)) {
+          records.value = data
+        } else if (data) {
+          records.value = [data]
+        } else {
+          records.value = []
+        }
+        isDownloading.value = false
+        downloadProgress.value = 0
+        downloadTotal.value = records.value.length
+        cancelDownload.value = false
+        downloadCanvasQRCode()
+      } else {
+        records.value = []
+      }
+    },
+    onCancel() {
+      if (isDownloading.value) {
+        message.info('正在保存已处理的数据，即将完成并关闭...')
+        cancelDownload.value = true
+        return
+      }
+      setTimeout(() => {
+        modalApi.close()
+        message.destroy()
+      }, 500)
+    },
+    onConfirm() {
+      modalApi.close()
+    }
+  })
+
+  const dataUrlToBlob = async (dataUrl: string) => {
+    const res = await fetch(dataUrl)
+    return await res.blob()
+  }
+
+  const downloadCanvasQRCode = async () => {
+    // 如果没有数据就不下载
+    if (records.value.length === 0) {
+      message.warning('暂无设备数据，无法下载')
+      return
+    }
+
+    try {
+      isDownloading.value = true
+      cancelDownload.value = false
+
+      async function* makeZipStream() {
+        const batchSize = 10 // 每批次处理 10 张
+        for (let i = 0; i < records.value.length; i++) {
+          if (cancelDownload.value) break // 用户触发中断，提前结束
+          const targetEl = document.querySelector(`#qr-card-item-${i}`) as HTMLElement
+          if (!targetEl) continue
+          // 强制等待一帧
+          await new Promise(resolve => requestAnimationFrame(resolve))
+          const blob = await domToBlob(targetEl, {
+            scale: 2, // 这里的 scale 建议设为 2，以保证打印清晰度
+            quality: 1,
+            backgroundColor: '#ffffff',
+            fetch: { bypassingCache: true }
+          })
+          const item = records.value[i]
+          const fileName = `${item.code || '条码'}_${i + 1}.png`
+
+          // 分片释放主线程控制权：每渲染到一定批次，或者单次循环，给一次浏览器喘息和更新进度条的机会
+          downloadProgress.value = i + 1
+          if (i % batchSize === 0) {
+            await new Promise(resolve => setTimeout(resolve, 10))
+          }
+
+          yield {
+            name: fileName,
+            lastModified: new Date(),
+            input: blob
+          }
+        }
+      }
+      /*
+       */
+      const fileName = `资产条码批量分片打包_${Date.now()}.zip`
+      const hideMsg = message.loading('正在下载，请勿离开当前页面，请耐心等待...', 0)
+
+      const zipResponse = downloadZip(makeZipStream())
+      const zipBlob = await zipResponse.blob()
+      hideMsg()
+
+      saveAs(zipBlob, fileName)
+      message.success('下载完成！')
+      modalApi.close()
+    } catch {
+      modalApi.close()
+      message.error('下载任务中断或报错')
+      setTimeout(() => {
+        message.destroy()
+      }, 1000)
+    } finally {
+      isDownloading.value = false
+      downloadProgress.value = 0
+      cancelDownload.value = false
+    }
+  }
+
+  // 根据数据灵活取字段（兼容传入后台真实实体或模拟数据）
+  const getDeviceName = (item: any) => item.deviceName || '-'
+  const getSpecModel = (item: any) => item.specModel || '-'
+  const getDeviceCode = (item: any) => item.deviceCode || '-'
+  const getCompany = (item: any) => item.deptName || '-'
+  const getQrUrl = (item: any) => item.qrCodeUrl || '-'
+
+  defineExpose(modalApi)
+</script>
+
+<template>
+  <Modal
+    title="批量下载"
+    class="w-[500px]"
+    :footer="false"
+    :fullscreen-button="false"
+    :header="false"
+  >
+    <div class="qrcode-container p-4">
+      <!-- 进度反馈和操作按钮 -->
+      <div class="flex flex-col items-center justify-center mt-2 px-6">
+        <div v-if="isDownloading" class="w-full text-center mt-2 mb-4">
+          <Progress
+            status="active"
+            :percent="Number(((downloadProgress / downloadTotal) * 100).toFixed(1))"
+          />
+          <div class="text-[#666] mt-2 text-sm">
+            正在下载：{{ downloadProgress }} / {{ downloadTotal }}
+          </div>
+        </div>
+      </div>
+      <div
+        id="qrDataWrapper"
+        class="bg-white p-1"
+        style="position: absolute; top: -9999px; left: -9999px; width: 450px"
+      >
+        <div
+          v-for="(item, index) in records"
+          :key="index"
+          :id="`qr-card-item-${index}`"
+          class="qr-card flex items-start border border-[#d9d9d9] bg-white p-3 mb-4 rounded-sm"
+        >
+          <!-- 左侧二维码区 -->
+          <div class="qr-left mr-1 flex items-center justify-center">
+            <QRCode :value="getQrUrl(item)" :size="120" :bordered="false" />
+          </div>
+
+          <!-- 右侧信息区 -->
+          <div class="qr-right flex flex-1 flex-col justify-between py-3">
+            <div>
+              <div class="mb-2 text-[17px] font-medium">
+                {{ getDeviceName(item) }}
+              </div>
+              <div class="text-[14px] text-[#333] mb-1">规格型号：{{ getSpecModel(item) }}</div>
+              <div class="text-[14px] text-[#333]">设备编码：{{ getDeviceCode(item) }}</div>
+            </div>
+
+            <div class="mt-4 text-[14px] text-[#333]">
+              {{ getCompany(item) }}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="records.length === 0" class="text-center text-gray-400 py-10">暂无设备数据</div>
+    </div>
+  </Modal>
+</template>
+
+<style scoped lang="less">
+  .qrcode-container {
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+
+  .qr-card {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+    transition: all 0.2s;
+
+    &:hover {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+  }
+</style>
+
+
